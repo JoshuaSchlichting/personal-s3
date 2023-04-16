@@ -4,3 +4,4 @@ terraform/terraform.tfstate.backup
 __debug_bin
 bin/
 out/
+.vscode/
