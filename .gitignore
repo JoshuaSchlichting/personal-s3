@@ -1,1 +1,4 @@
 terraform/.terraform/
+__debug_bin
+bin/
+out/
