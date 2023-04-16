@@ -15,6 +15,7 @@ import (
 
 type s3ClientWrapper struct {
 	s3Client *s3.Client
+	cache    map[string]struct{}
 }
 
 func newS3ClientWrapper() (*s3ClientWrapper, error) {
