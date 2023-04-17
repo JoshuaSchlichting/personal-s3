@@ -7,7 +7,12 @@ import (
 	"path"
 )
 
-func createCache(bucketName string) error {
+type S3Cache struct {
+	cache      map[string]struct{}
+	bucketName string
+}
+
+func createCacheFileIfNotExists(bucketName string) error {
 	dirName := os.Getenv("HOME") + "/.personal-s3"
 	if _, err := os.Stat(dirName); os.IsNotExist(err) {
 		// Create directory if it doesn't exist
@@ -20,8 +25,9 @@ func createCache(bucketName string) error {
 	} else {
 		fmt.Println("Directory already exists:", dirName)
 	}
-	if _, err := os.Stat(path.Join(dirName, bucketName)); os.IsNotExist(err) {
-		file, err := os.Create(path.Join(dirName, bucketName))
+	cacheFilename := path.Join(dirName, bucketName+".json")
+	if _, err := os.Stat(cacheFilename); os.IsNotExist(err) {
+		file, err := os.Create(cacheFilename)
 		if err != nil {
 			fmt.Println("Error creating file:", err)
 			return err
@@ -31,10 +37,12 @@ func createCache(bucketName string) error {
 	}
 	return nil
 }
-func loadCache(bucketName string) (map[string]struct{}, error) {
-	cache := make(map[string]struct{})
+func loadCache(bucketName string) (*S3Cache, error) {
+	createCacheFileIfNotExists(bucketName)
 
-	file, err := os.Open(path.Join(os.Getenv("HOME"), ".personal-s3", bucketName))
+	cache := make(map[string]struct{})
+	cacheFilename := path.Join(os.Getenv("HOME"), ".personal-s3", bucketName+".json")
+	file, err := os.Open(cacheFilename)
 	if err != nil {
 		return nil, err
 	}
@@ -45,25 +53,33 @@ func loadCache(bucketName string) (map[string]struct{}, error) {
 		return nil, err
 	}
 
-	result := make(map[string]struct{})
+	result := &S3Cache{
+		cache:      cache,
+		bucketName: bucketName,
+	}
 	for key := range cache {
-		result[key] = struct{}{}
+		result.cache[key] = struct{}{}
 	}
 
 	return result, nil
 }
 
-func saveCache(bucketName string, cache map[string]struct{}) error {
-	file, err := os.OpenFile(path.Join(os.Getenv("HOME"), ".personal-s3", bucketName), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+func (c *S3Cache) saveCache() error {
+	file, err := os.OpenFile(path.Join(os.Getenv("HOME"), ".personal-s3", c.bucketName), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	err = json.NewEncoder(file).Encode(cache)
+	err = json.NewEncoder(file).Encode(c.cache)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (c *S3Cache) isCached(key string) bool {
+	_, ok := c.cache[key]
+	return ok
 }

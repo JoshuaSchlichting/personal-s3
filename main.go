@@ -15,22 +15,27 @@ import (
 
 type s3ClientWrapper struct {
 	s3Client *s3.Client
-	cache    map[string]struct{}
+	cache    S3Cache
 }
 
-func newS3ClientWrapper() (*s3ClientWrapper, error) {
+func newS3ClientWrapper(bucketName string) (*s3ClientWrapper, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %v", err)
 	}
 	s3Client := s3.NewFromConfig(cfg)
 
+	cache, err := loadCache(bucketName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load cache: %v", err)
+	}
 	return &s3ClientWrapper{
 		s3Client: s3Client,
+		cache:    *cache,
 	}, nil
 }
 
-func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string) error {
+func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useCache bool) error {
 
 	// Get list of files in folder
 	files, err := ListDir(dir)
@@ -46,6 +51,22 @@ func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string) erro
 
 	// Upload files to S3 bucket
 	for j, file := range relativeFileNames {
+		if useCache {
+			if c.cache.isCached(file) {
+				log.Printf("object %s already exists in bucket %s, skipping", file, bucketName)
+				continue
+			}
+			err = UploadFileToBucket(c.s3Client, bucketName, files[j])
+			if err != nil {
+				log.Printf("failed to upload file %s: %v", file, err)
+			} else {
+				log.Print("upload complete:", file)
+				c.cache.cache[file] = struct{}{}
+				c.cache.saveCache()
+			}
+			continue
+		}
+
 		exists, err := c.ObjectExists(bucketName, file)
 		if err != nil {
 			log.Printf("failed to check if object exists: %v", err)
@@ -55,11 +76,14 @@ func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string) erro
 			log.Printf("object %s already exists in bucket %s, skipping", file, bucketName)
 			continue
 		}
-		log.Print("uploading file ", file, " to bucket", bucketName)
+		log.Print("uploading file ", file, " to bucket ", bucketName)
 		err = UploadFileToBucket(c.s3Client, bucketName, files[j])
-		log.Print("uploaded complete:", file)
 		if err != nil {
 			log.Printf("failed to upload file %s: %v", file, err)
+		} else {
+			log.Print("upload complete:", file)
+			c.cache.cache[file] = struct{}{}
+			c.cache.saveCache()
 		}
 	}
 
@@ -124,6 +148,7 @@ func main() {
 	// Parse command line flags
 	bucketNamePtr := flag.String("bucket", "", "name of the S3 bucket")
 	syncDirPtr := flag.String("dir", "", "directory to sync to S3 bucket")
+	useCache := flag.Bool("cache", false, "use cache to skip files that have already been uploaded in lieu of HEAD-OBJECT calls to AWS")
 	flag.Parse()
 
 	// Check that the bucket name is specified
@@ -132,13 +157,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	s3Wrapper, err := newS3ClientWrapper()
+	s3Wrapper, err := newS3ClientWrapper(*bucketNamePtr)
 	if err != nil {
 		log.Fatalf("failed to create S3 client wrapper: %v", err)
 	}
 
 	// Sync folder to S3 bucket
-	err = s3Wrapper.SyncFolderToBucket(*bucketNamePtr, *syncDirPtr)
+	err = s3Wrapper.SyncFolderToBucket(*bucketNamePtr, *syncDirPtr, *useCache)
 	if err != nil {
 		log.Fatalf("failed to sync folder to S3 bucket: %v", err)
 	}
