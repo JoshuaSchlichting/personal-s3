@@ -131,7 +131,7 @@ func ListDir(dir string) ([]string, error) {
 
 const (
 	// Define the part size in MB
-	partSizeMB           = 10
+	partSizeMB           = 100
 	partSize             = partSizeMB * 1024 * 1024
 	maxConcurrentUploads = 1000
 )
