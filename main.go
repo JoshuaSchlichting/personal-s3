@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -164,6 +165,7 @@ func UploadFileToBucket(s3Client *s3.Client, bucketName string, filePath string)
 
 	fmt.Printf("Uploading file '%s' to bucket '%s'\n", filePath, bucketName)
 	fmt.Printf("Upload status: 0%%")
+	startTime := time.Now()
 	for i := 1; i <= numParts; i++ {
 		partStart := int64((i - 1) * partSize)
 		partEnd := int64(i * partSize)
@@ -191,7 +193,13 @@ func UploadFileToBucket(s3Client *s3.Client, bucketName string, filePath string)
 		}
 
 		partETags = append(partETags, *uploadResp.ETag)
-		fmt.Printf("\rUpload status: %d%%", (i*100)/numParts)
+		percentage := (i * 100) / numParts
+		fmt.Printf("\rUpload status: %d%%", percentage)
+		if percentage > 0 {
+			elapsedTime := time.Since(startTime)
+			uploadSpeed := float64(partEnd-partStart) / elapsedTime.Seconds() / 1024 / 1024
+			fmt.Printf(" Upload speed: %.2f MB/s", uploadSpeed)
+		}
 	}
 
 	// Complete the multipart upload
