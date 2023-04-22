@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -9,8 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type s3ClientWrapper struct {
@@ -56,6 +59,7 @@ func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useC
 				log.Printf("object %s already exists in bucket %s, skipping", file, bucketName)
 				continue
 			}
+			log.Println("uploading file ", files[j], " to bucket: ", bucketName)
 			err = UploadFileToBucket(c.s3Client, bucketName, files[j])
 			if err != nil {
 				log.Printf("failed to upload file %s: %v", file, err)
@@ -124,24 +128,99 @@ func ListDir(dir string) ([]string, error) {
 	return files, nil
 }
 
+const (
+	// Define the part size in MB
+	partSize = 5 * 1024 * 1024
+)
+
 func UploadFileToBucket(s3Client *s3.Client, bucketName string, filePath string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open file %s: %v",
-			filePath, err)
+		return fmt.Errorf("failed to open file %s: %v", filePath, err)
 	}
 	defer file.Close()
 
-	_, err = s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+	// Get the file size
+	fileInfo, _ := file.Stat()
+	fileSize := fileInfo.Size()
+
+	// Create the multipart upload
+	createResp, err := s3Client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
 		Bucket: &bucketName,
-		Key:    &filePath,
-		Body:   file,
+		Key:    aws.String(filepath.Base(filePath)),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to put object: %v", err)
+		return fmt.Errorf("failed to create multipart upload: %v", err)
 	}
 
+	uploadID := createResp.UploadId
+	fmt.Printf("Upload ID: %s\n", *uploadID)
+
+	// Calculate the number of parts to split the file into
+	numParts := int(fileSize/partSize) + 1
+
+	// Initialize the slice to store the ETags of the uploaded parts
+	var partETags []string
+
+	fmt.Printf("Uploading file '%s' to bucket '%s'\n", filePath, bucketName)
+	fmt.Printf("Upload status: 0%%")
+	for i := 1; i <= numParts; i++ {
+		partStart := int64((i - 1) * partSize)
+		partEnd := int64(i * partSize)
+		if partEnd > fileSize {
+			partEnd = fileSize
+		}
+
+		// Read the part data
+		partData := make([]byte, partEnd-partStart)
+		_, err := file.ReadAt(partData, partStart)
+		if err != nil {
+			return fmt.Errorf("failed to read file part: %v", err)
+		}
+
+		// Upload the part
+		uploadResp, err := s3Client.UploadPart(context.TODO(), &s3.UploadPartInput{
+			Bucket:     &bucketName,
+			Key:        aws.String(filepath.Base(filePath)),
+			UploadId:   uploadID,
+			PartNumber: *aws.Int32(int32(i)),
+			Body:       bytes.NewReader(partData),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to upload part: %v", err)
+		}
+
+		partETags = append(partETags, *uploadResp.ETag)
+		fmt.Printf("\rUpload status: %d%%", (i*100)/numParts)
+	}
+
+	// Complete the multipart upload
+	_, err = s3Client.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
+		Bucket:   &bucketName,
+		Key:      aws.String(filepath.Base(filePath)),
+		UploadId: uploadID,
+		MultipartUpload: &s3types.CompletedMultipartUpload{
+			Parts: buildCompleteMultipartUploadParts(numParts, partETags),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to complete multipart upload: %v", err)
+	}
+
+	fmt.Println("File uploaded successfully")
+
 	return nil
+}
+
+func buildCompleteMultipartUploadParts(numParts int, partETags []string) []s3types.CompletedPart {
+	var parts []s3types.CompletedPart
+	for i := 1; i <= numParts; i++ {
+		parts = append(parts, s3types.CompletedPart{
+			ETag:       aws.String(partETags[i-1]),
+			PartNumber: *aws.Int32(int32(i)),
+		})
+	}
+	return parts
 }
 
 func main() {
