@@ -88,7 +88,7 @@ func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useC
 			}
 			log.Println("uploading file ", files[j], " to bucket: ", bucketName)
 
-			err = UploadFileToBucket(c.s3Client, bucketName, files[j], file)
+			err = uploadFileToBucket(c.s3Client, bucketName, files[j], file)
 			if err != nil {
 				log.Printf("failed to upload file %s: %v", file, err)
 				panic(err)
@@ -110,7 +110,7 @@ func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useC
 			continue
 		}
 		log.Print("uploading file ", file, " to bucket ", bucketName)
-		err = UploadFileToBucket(c.s3Client, bucketName, files[j], file)
+		err = uploadFileToBucket(c.s3Client, bucketName, files[j], file)
 		if err != nil {
 			log.Printf("failed to upload file %s: %v", file, err)
 		} else {
@@ -123,7 +123,7 @@ func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useC
 	return nil
 }
 
-func UploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string) error {
+func uploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %v", filePath, err)
