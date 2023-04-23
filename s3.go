@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -12,139 +18,260 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-func NewS3Bucket(bucketName string) *Bucket {
-	sdkConfig, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		panic(err)
-	}
-	s3Client := s3.NewFromConfig(sdkConfig)
+const (
+	// Define the part size in MB
+	partSizeMB           = 5
+	partSize             = partSizeMB * 1024 * 1024
+	maxConcurrentUploads = 8
+)
 
-	return &Bucket{
-		Client:     s3Client,
-		bucketName: bucketName,
-	}
+type eTagTracker struct {
+	PartNumber int
+	Etag       string
 }
 
-func ListBuckets() {
-	sdkConfig, err := config.LoadDefaultConfig(context.TODO())
+type s3ClientWrapper struct {
+	s3Client *s3.Client
+	cache    S3Cache
+}
+
+func newS3ClientWrapper(bucketName string) (*s3ClientWrapper, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		fmt.Println("Couldn't load default configuration. Have you set up your AWS account?")
-		fmt.Println(err)
-		return
+		return nil, fmt.Errorf("failed to load AWS config: %v", err)
 	}
-	s3Client := s3.NewFromConfig(sdkConfig)
-	count := 10
-	fmt.Printf("Let's list up to %v buckets for your account.\n", count)
-	result, err := s3Client.ListBuckets(context.TODO(), &s3.ListBucketsInput{})
+	s3Client := s3.NewFromConfig(cfg)
+
+	cache, err := loadCache(bucketName)
 	if err != nil {
-		fmt.Printf("Couldn't list buckets for your account. Here's why: %v\n", err)
-		return
+		return nil, fmt.Errorf("failed to load cache: %v", err)
 	}
-	if len(result.Buckets) == 0 {
-		fmt.Println("You don't have any buckets!")
-	} else {
-		for _, bucket := range result.Buckets[:count] {
-			fmt.Printf("\t%v\n", *bucket.Name)
+	return &s3ClientWrapper{
+		s3Client: s3Client,
+		cache:    *cache,
+	}, nil
+}
+func (c *s3ClientWrapper) ObjectExists(bucketName string, key string) (bool, error) {
+	_, err := c.s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		Bucket: &bucketName,
+		Key:    &key,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "NotFound") {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to check if object exists: %v", err)
+	}
+
+	return true, nil
+}
+func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useCache bool) error {
+
+	// Get list of files in folder
+	files, err := listDir(dir)
+	if err != nil {
+		return fmt.Errorf("failed to list files in folder: %v", err)
+	}
+
+	relativeFileNames := make([]string, len(files))
+	// get filenames relative to the target directory
+	for i, file := range files {
+		relativeFileNames[i] = file[len(dir)-len(filepath.Base(dir)):]
+	}
+
+	// Upload files to S3 bucket
+	for j, file := range relativeFileNames {
+		if useCache {
+			if c.cache.isCached(file) {
+				log.Printf("object %s already exists in bucket %s, skipping", file, bucketName)
+				continue
+			}
+			log.Println("uploading file ", files[j], " to bucket: ", bucketName)
+
+			err = UploadFileToBucket(c.s3Client, bucketName, files[j], file)
+			if err != nil {
+				log.Printf("failed to upload file %s: %v", file, err)
+				panic(err)
+			} else {
+				log.Print("upload complete:", file)
+				c.cache.cache[file] = struct{}{}
+				c.cache.saveCache()
+			}
+			continue
+		}
+
+		exists, err := c.ObjectExists(bucketName, file)
+		if err != nil {
+			log.Printf("failed to check if object exists: %v", err)
+			return err
+		}
+		if exists {
+			log.Printf("object %s already exists in bucket %s, skipping", file, bucketName)
+			continue
+		}
+		log.Print("uploading file ", file, " to bucket ", bucketName)
+		err = UploadFileToBucket(c.s3Client, bucketName, files[j], file)
+		if err != nil {
+			log.Printf("failed to upload file %s: %v", file, err)
+		} else {
+			log.Print("upload complete:", file)
+			c.cache.cache[file] = struct{}{}
+			c.cache.saveCache()
 		}
 	}
-}
 
-type Bucket struct {
-	Client     *s3.Client
-	bucketName string
-}
-
-func (b *Bucket) Name() string {
-	return b.bucketName
-}
-
-func (b *Bucket) DeleteAllFiles(prefix string) error {
-	if prefix == "" {
-		log.Printf("Prefix is empty. Not deleting any files")
-		return nil
-	}
-	objects, err := b.ListObjects()
-	if err != nil {
-		fmt.Println(err)
-		return err
-	}
-	for _, object := range objects {
-		if strings.HasPrefix(*object.Key, prefix) {
-			fmt.Println("Deleting: ", *object.Key)
-			b.DeleteFile(*object.Key)
-		}
-	}
 	return nil
 }
 
-func (b *Bucket) DeleteFile(objectName string) {
-	_, err := b.Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
-		Bucket: aws.String(b.bucketName),
-		Key:    aws.String(objectName),
+func UploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %v", filePath, err)
+	}
+	defer file.Close()
+
+	// Get the file size
+	fileInfo, _ := file.Stat()
+	fileSize := fileInfo.Size()
+
+	// Create the multipart upload
+	createResp, err := s3Client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+		Bucket: &bucketName,
+		Key:    aws.String(key),
 	})
 	if err != nil {
-		log.Printf("Couldn't delete object %v from bucket %v. Here's why: %v\n", objectName, b.bucketName, err)
+		return fmt.Errorf("failed to create multipart upload: %v", err)
 	}
-}
 
-func (b *Bucket) ListObjects() ([]s3types.Object, error) {
-	p := s3.NewListObjectsV2Paginator(b.Client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(b.bucketName),
-	})
-	var results []s3types.Object
-	for p.HasMorePages() {
-		page, err := p.NextPage(context.Background())
+	uploadID := createResp.UploadId
+	fmt.Printf("Upload ID: %s\n", *uploadID)
+
+	// Calculate the number of parts to split the file into
+	numParts := int(fileSize/partSize) + 1
+	log.Printf("Splitting file into %d parts of size %dMB each\n", numParts, partSizeMB)
+	log.Println("Concurrent Uploads: ", maxConcurrentUploads)
+	// Initialize the slice to store the ETags of the uploaded parts
+	var partETags []eTagTracker
+
+	// Create a channel to receive part ETags
+	etagChan := make(chan eTagTracker, numParts)
+
+	// Launch a Go routine for each part to upload it concurrently
+	fmt.Printf("Uploading file '%s' to bucket '%s'\n", filePath, bucketName)
+	fmt.Printf("Upload status: 0%%")
+	startTime := time.Now()
+	// Use a channel to limit the number of concurrent uploads
+	sem := make(chan struct{}, maxConcurrentUploads)
+	wg := sync.WaitGroup{}
+	var completedParts int = 0
+	for i := 1; i <= numParts; i++ {
+		wg.Add(1)
+		partStart := int64((i - 1) * partSize)
+		partEnd := int64(i * partSize)
+		if partEnd > fileSize {
+			partEnd = fileSize
+		}
+
+		// Read the part data
+		partData := make([]byte, partEnd-partStart)
+		_, err := file.ReadAt(partData, partStart)
 		if err != nil {
-			log.Printf("Couldn't list objects in bucket %v: %v\n", b.bucketName, err)
-			return nil, err
+			return fmt.Errorf("failed to read file part: %v", err)
 		}
-		results = append(results, page.Contents...)
+		sem <- struct{}{}
+		// Launch a Go routine to upload the part
+		go func(partNumber int) {
+			defer func() { <-sem }()
+			defer wg.Done()
+
+			// Upload the part
+			uploadResp, err := s3Client.UploadPart(context.TODO(), &s3.UploadPartInput{
+				Bucket:     &bucketName,
+				Key:        aws.String(key),
+				UploadId:   uploadID,
+				PartNumber: *aws.Int32(int32(partNumber)),
+				Body:       bytes.NewReader(partData),
+			})
+			if err != nil {
+				log.Fatalf("failed to upload part: %v", err)
+			}
+			completedParts++
+			// Send the ETag to the channel
+			etagChan <- eTagTracker{
+				Etag:       *uploadResp.ETag,
+				PartNumber: partNumber,
+			}
+
+			percentage := (completedParts * 100) / numParts
+			fmt.Printf("\rUpload status: %d%%", percentage)
+			if percentage > 0 {
+				elapsedTime := time.Since(startTime)
+				uploadSpeed := float64(completedParts*partSizeMB) / elapsedTime.Seconds()
+				fmt.Printf(" Current upload speed: %.2f MB/s ", uploadSpeed)
+			}
+		}(i)
 	}
-	return results, nil
+	// Wait for all uploads to complete
+	wg.Wait()
+	fmt.Printf("\rUpload status: 100%%                 \n")
+	fmt.Println("All parts uploaded at this point. Waiting for completion...")
+	// Collect the ETags of the uploaded parts
+	for i := 1; i <= numParts; i++ {
+		partETags = append(partETags, <-etagChan)
+	}
+	// Wait for all uploads to complete before completing the multipart upload
+	for i := 0; i < maxConcurrentUploads; i++ {
+		sem <- struct{}{}
+	}
+	log.Println("Multipart upload completed. Completing multipart upload in cloud storage...")
+	// Complete the multipart upload
+	_, err = s3Client.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
+		Bucket:          &bucketName,
+		Key:             aws.String(key),
+		UploadId:        uploadID,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: buildCompleteMultipartUploadParts(numParts, partETags)},
+	})
+	log.Println("Multipart upload completed.")
+	if err != nil {
+		return fmt.Errorf("failed to complete multipart upload: %v", err)
+	}
+	// Print the upload details
+	fmt.Printf("\nSuccessfully uploaded file '%s' to bucket '%s'\n", filePath, bucketName)
+	return nil
 }
 
-func (b *Bucket) GetObjectsInBucket(bucketName string) (objectNames []string) {
+func buildCompleteMultipartUploadParts(numParts int, partETags []eTagTracker) []s3types.CompletedPart {
+	var parts []s3types.CompletedPart
 
-	objects, error := b.ListObjects()
-	if error != nil {
-		fmt.Println(error)
+	// sort partETags by part number
+	sort.Slice(partETags, func(i, j int) bool {
+		return partETags[i].PartNumber < partETags[j].PartNumber
+	})
+
+	for i := 1; i <= numParts; i++ {
+		parts = append(parts, s3types.CompletedPart{
+			ETag:       aws.String(partETags[i-1].Etag),
+			PartNumber: *aws.Int32(int32(partETags[i-1].PartNumber)),
+		})
 	}
-	for _, object := range objects {
-		fmt.Println(*object.Key)
-	}
-	for _, object := range objects {
-		objectNames = append(objectNames, *object.Key)
-	}
-	return objectNames
+	return parts
 }
 
-func (b *Bucket) PrintObjectsInBucket(bucketName string) {
-	objects, error := b.ListObjects()
-	if error != nil {
-		fmt.Println(error)
-	}
-	for _, object := range objects {
-		fmt.Println(*object.Key)
-	}
-}
+func listDir(dir string) ([]string, error) {
+	var files []string
 
-func (b *Bucket) DeleteAllFilesWhereNameContains(target string) {
-	if strings.TrimSpace(target) == "" {
-		log.Println("Target is empty. Not deleting any files")
-		return
-	}
-	if target == "/" {
-		log.Println("Target is root. Not deleting any files")
-		return
-	}
-	objects, error := b.ListObjects()
-	if error != nil {
-		log.Fatal(error)
-	}
-	for _, object := range objects {
-		if strings.Contains(*object.Key, target) {
-			log.Println("Deleting: ", *object.Key)
-			b.DeleteFile(*object.Key)
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
+		if !info.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to walk folder: %v", err)
 	}
+
+	return files, nil
 }
