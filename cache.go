@@ -65,13 +65,14 @@ func loadCache(bucketName string) (*S3Cache, error) {
 }
 
 func (c *S3Cache) saveCache() error {
-	file, err := os.OpenFile(path.Join(os.Getenv("HOME"), ".personal-s3", c.bucketName), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	file, err := os.OpenFile(path.Join(os.Getenv("HOME"), ".personal-s3", c.bucketName+".json"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-
-	err = json.NewEncoder(file).Encode(c.cache)
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	err = encoder.Encode(c.cache)
 	if err != nil {
 		return err
 	}
