@@ -1,6 +1,6 @@
 # Personal-S3
 
-A personal S3 project using Terraform and a frontend served by Go.
+A personal S3 project using Terraform and a frontend served by Go. It favors back-up safety over convenience, and as such the hard coded behaviors of this application can create cloud storage objects, but it cannot delete them.
 
 `personal-s3` is a simple tool to sync a local directory to an S3 bucket. It is intended to be used as a personal cloud.
 
