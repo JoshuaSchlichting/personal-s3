@@ -51,6 +51,7 @@ func newS3ClientWrapper(bucketName string) (*s3ClientWrapper, error) {
 		cache:    *cache,
 	}, nil
 }
+
 func (c *s3ClientWrapper) ObjectExists(bucketName string, key string) (bool, error) {
 	_, err := c.s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
 		Bucket: &bucketName,
@@ -65,6 +66,7 @@ func (c *s3ClientWrapper) ObjectExists(bucketName string, key string) (bool, err
 
 	return true, nil
 }
+
 func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useCache bool) error {
 
 	// Get list of files in folder
