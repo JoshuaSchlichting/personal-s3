@@ -38,13 +38,13 @@ type s3ClientWrapper struct {
 func newS3ClientWrapper(bucketName string) (*s3ClientWrapper, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config: %v", err)
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 	s3Client := s3.NewFromConfig(cfg)
 
 	cache, err := loadCache(bucketName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load cache: %v", err)
+		return nil, fmt.Errorf("failed to load cache: %w", err)
 	}
 	return &s3ClientWrapper{
 		s3Client: s3Client,
@@ -61,62 +61,58 @@ func (c *s3ClientWrapper) ObjectExists(bucketName string, key string) (bool, err
 		if strings.Contains(err.Error(), "NotFound") {
 			return false, nil
 		}
-		return false, fmt.Errorf("failed to check if object exists: %v", err)
+		return false, fmt.Errorf("failed to check if object exists: %w", err)
 	}
 
 	return true, nil
 }
 
-func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useCache bool) error {
+func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, overwriteExistingFiles bool, storageClass s3types.StorageClass) error {
 
 	// Get list of files in folder
 	files, err := listDir(dir)
 	if err != nil {
-		return fmt.Errorf("failed to list files in folder: %v", err)
+		return fmt.Errorf("failed to list files in folder: %w", err)
 	}
 
 	relativeFileNames := make([]string, len(files))
 	// get filenames relative to the target directory
 	for i, file := range files {
-		relativeFileNames[i] = file[len(dir)-len(filepath.Base(dir)):]
+		relativeFileNames[i] = strings.TrimPrefix(file, dir+"/")
 	}
 
 	// Upload files to S3 bucket
 	for j, file := range relativeFileNames {
-		if useCache {
-			if c.cache.isCached(file) {
-				log.Printf("object %s already exists in bucket %s, skipping", file, bucketName)
-				continue
-			}
+		if overwriteExistingFiles {
 			log.Println("uploading file ", files[j], " to bucket: ", bucketName)
 
-			err = uploadFileToBucket(c.s3Client, bucketName, files[j], file)
+			err = uploadFileToBucket(c.s3Client, bucketName, files[j], file, storageClass)
 			if err != nil {
-				log.Printf("failed to upload file %s: %v", file, err)
-				panic(err)
+				return fmt.Errorf("failed to upload file %s: %w", file, err)
 			} else {
-				log.Print("upload complete:", file)
+				log.Print("upload complete: ", file)
 				c.cache.cache[file] = struct{}{}
 				c.cache.saveCache()
 			}
 			continue
 		}
 
+		// Check if the file exists in the bucket
 		exists, err := c.ObjectExists(bucketName, file)
 		if err != nil {
-			log.Printf("failed to check if object exists: %v", err)
-			return err
+			return fmt.Errorf("failed to check if object exists: %w", err)
 		}
-		if exists {
-			log.Printf("object %s already exists in bucket %s, skipping", file, bucketName)
+		if exists || c.cache.isCached(file) {
+			log.Printf("Per the cache file, object %s already exists in bucket %s, skipping", file, bucketName)
 			continue
 		}
+
 		log.Print("uploading file ", file, " to bucket ", bucketName)
-		err = uploadFileToBucket(c.s3Client, bucketName, files[j], file)
+		err = uploadFileToBucket(c.s3Client, bucketName, files[j], file, storageClass)
 		if err != nil {
-			log.Printf("failed to upload file %s: %v", file, err)
+			return fmt.Errorf("failed to upload file %s: %w", file, err)
 		} else {
-			log.Print("upload complete:", file)
+			log.Print("upload complete: ", file)
 			c.cache.cache[file] = struct{}{}
 			c.cache.saveCache()
 		}
@@ -125,10 +121,10 @@ func (c *s3ClientWrapper) SyncFolderToBucket(bucketName string, dir string, useC
 	return nil
 }
 
-func uploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string) error {
+func uploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string, storageClass s3types.StorageClass) error {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open file %s: %v", filePath, err)
+		return fmt.Errorf("failed to open file %s: %w", filePath, err)
 	}
 	defer file.Close()
 
@@ -138,11 +134,12 @@ func uploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string) e
 
 	// Create the multipart upload
 	createResp, err := s3Client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
-		Bucket: &bucketName,
-		Key:    aws.String(key),
+		Bucket:       &bucketName,
+		Key:          aws.String(key),
+		StorageClass: storageClass,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create multipart upload: %v", err)
+		return fmt.Errorf("failed to create multipart upload: %w", err)
 	}
 
 	uploadID := createResp.UploadId
@@ -178,7 +175,7 @@ func uploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string) e
 		partData := make([]byte, partEnd-partStart)
 		_, err := file.ReadAt(partData, partStart)
 		if err != nil {
-			return fmt.Errorf("failed to read file part: %v", err)
+			return fmt.Errorf("failed to read file part: %w", err)
 		}
 		sem <- struct{}{}
 		// Launch a Go routine to upload the part
@@ -195,7 +192,7 @@ func uploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string) e
 				Body:       bytes.NewReader(partData),
 			})
 			if err != nil {
-				log.Fatalf("failed to upload part: %v", err)
+				panic(fmt.Errorf("failed to upload part: %w", err))
 			}
 			completedParts++
 			// Send the ETag to the channel
@@ -235,7 +232,7 @@ func uploadFileToBucket(s3Client *s3.Client, bucketName, filePath, key string) e
 	})
 	log.Println("Multipart upload completed.")
 	if err != nil {
-		return fmt.Errorf("failed to complete multipart upload: %v", err)
+		return fmt.Errorf("failed to complete multipart upload: %w", err)
 	}
 	// Print the upload details
 	fmt.Printf("\nSuccessfully uploaded file '%s' to bucket '%s'\n", filePath, bucketName)
@@ -272,7 +269,7 @@ func listDir(dir string) ([]string, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to walk folder: %v", err)
+		return nil, fmt.Errorf("failed to walk folder: %w", err)
 	}
 
 	return files, nil
